@@ -1,0 +1,103 @@
+import cv2
+import apriltag
+import numpy as np
+import detectaisle
+import threading
+import billingsystem
+import time
+import logging
+import os
+
+# Initialize the AprilTag detector
+detector = apriltag.Detector()
+
+# Initialize a set to store printed tag IDs
+printed_ids = set()
+
+# To track if TTS audio is currently playing
+audio_playing_event = threading.Event()
+
+# Camera parameters (You need to calibrate your camera to get these values)
+FOCAL_LENGTH = 800  # Example focal length in pixels (you should calibrate your camera to get this value)
+KNOWN_TAG_WIDTH = 0.075  # Real-world width of the AprilTag in meters
+
+# Distance threshold for triggering audio (in meters)
+DISTANCE_THRESHOLD = 1.20  # Only play audio if the distance is less than 1.2 meters
+
+# Open the webcam (usually index 0)
+cap = cv2.VideoCapture(0)
+
+# Ensure log directory exists
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+# Set up logging with a timestamp
+logging.basicConfig(filename=os.path.join(log_dir, "tag_detection.log"), level=logging.INFO,
+                    format='%(asctime)s - %(message)s')
+
+def detect_aisle_in_thread(tag_id):
+    if not audio_playing_event.is_set():
+        audio_playing_event.set()
+        detectaisle.detectaisle(tag_id)
+        time.sleep(20)  # Adjust based on audio length
+        audio_playing_event.clear()
+
+def estimate_distance(tag_width_in_image, focal_length, known_tag_width):
+    return (known_tag_width * focal_length) / tag_width_in_image
+
+# Function to start the billing system
+def start_billing_system():
+    billingsystem.main()  # Runs the billing system GUI
+
+# Start the billing system in a separate thread
+billing_thread = threading.Thread(target=start_billing_system, daemon=True)
+billing_thread.start()
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to grab frame")
+        break
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    detections = detector.detect(gray)
+
+    if not detections:
+        printed_ids.clear()
+
+    for detection in detections:
+        corners = detection.corners
+        top_left = np.array(corners[0])
+        top_right = np.array(corners[1])
+        tag_width_in_image = np.linalg.norm(top_left - top_right)
+
+        distance_to_tag = estimate_distance(tag_width_in_image, FOCAL_LENGTH, KNOWN_TAG_WIDTH)
+
+        cv2.putText(frame, f"Distance: {distance_to_tag:.2f} meters",
+                    (int(top_left[0]), int(top_left[1]) + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        cv2.putText(frame, f"ID: {detection.tag_id}",
+                    (int(top_left[0]), int(top_left[1]) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        cv2.putText(frame, f"Time: {timestamp}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        if distance_to_tag < DISTANCE_THRESHOLD and detection.tag_id not in printed_ids:
+            print(f"Detected tag ID: {detection.tag_id} at {distance_to_tag:.2f} meters")
+            printed_ids.add(detection.tag_id)
+            logging.info(f"Detected tag ID: {detection.tag_id} at {distance_to_tag:.2f} meters")
+            image_filename = f"logs/{timestamp}_tag_{detection.tag_id}.jpg"
+            cv2.imwrite(image_filename, frame)
+            threading.Thread(target=detect_aisle_in_thread, args=(detection.tag_id,), daemon=True).start()
+
+    cv2.imshow("AprilTag Detection", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
